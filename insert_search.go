@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"strconv"
 	"sync"
-	"time"
 )
 
 func newClient(address string) milvusclient.Client {
@@ -30,8 +29,17 @@ var partitionName = "default"
 var f1 = "pk"
 var f2 = "random"
 var f3 = "embeddings"
+var dim = 128
+var topk = 50
+var address = "localhost:19530"
+var nq = 1
+var sampleCount = 1000
+var threadCount = 20
+var shardNum = 10
 
-func prepareSchema(dim int) *entity.Schema {
+var vectors = prepareVectors(nq)
+
+func prepareSchema() *entity.Schema {
 	return &entity.Schema{
 		CollectionName: collectionName,
 		Description:    "",
@@ -57,30 +65,6 @@ func prepareSchema(dim int) *entity.Schema {
 				},
 			},
 		},
-	}
-}
-
-func prepare(client milvusclient.Client, dim int) {
-	ctx := context.Background()
-	has, err := client.HasCollection(ctx, collectionName)
-	if err != nil {
-		panic(err)
-	}
-	if has {
-		err := client.DropCollection(ctx, collectionName)
-		if err != nil {
-			panic(err)
-		}
-	}
-	schema := prepareSchema(dim)
-	if err := client.CreateCollection(ctx, schema, 2); err != nil {
-		panic(err)
-	}
-	if err := client.CreatePartition(ctx, collectionName, partitionName); err != nil {
-		panic(err)
-	}
-	if err := client.LoadCollection(ctx, collectionName, false) ; err != nil {
-		panic(err)
 	}
 }
 
@@ -110,7 +94,7 @@ func generateFloat32Array(numRows int) []float32 {
 	return ret
 }
 
-func generateFloatVectors(numRows, dim int) [][]float32 {
+func generateFloatVectors(numRows int) [][]float32 {
 	ret := make([][]float32, 0, numRows)
 	for i := 0; i < numRows; i++ {
 		x := make([]float32, 0, dim)
@@ -122,24 +106,22 @@ func generateFloatVectors(numRows, dim int) [][]float32 {
 	return ret
 }
 
-func prepareInsertData(iter int, num int, dim int) []entity.Column {
+func prepareInsertData(iter int, num int) []entity.Column {
 	pkColumn := entity.NewColumnInt64(f1, preparePks(iter, num))
 	randomColumn := entity.NewColumnDouble(f2, generateFloat64Array(num))
-	embeddingColumn := entity.NewColumnFloatVector(f3, dim, generateFloatVectors(num, dim))
+	embeddingColumn := entity.NewColumnFloatVector(f3, dim, generateFloatVectors(num))
 	return []entity.Column{pkColumn, randomColumn, embeddingColumn}
 }
 
-func insert(client milvusclient.Client, iter, num, dim int) {
-	columns := prepareInsertData(iter, num, dim)
-	start := time.Now()
+func insert(client milvusclient.Client, iter, num int) {
+	columns := prepareInsertData(iter, num)
 	_, err := client.Insert(context.Background(), collectionName, partitionName, columns...)
-	PutToInsertLatencys(int(time.Since(start).Milliseconds()))
 	if err != nil {
 		panic(err)
 	}
 }
 
-func prepareVectors(nq int, dim int) []entity.Vector {
+func prepareVectors(nq int) []entity.Vector {
 	ret := make([]entity.Vector, 0, nq)
 	for i := 0; i < nq; i++ {
 		x := generateFloat32Array(dim)
@@ -150,59 +132,79 @@ func prepareVectors(nq int, dim int) []entity.Vector {
 	return ret
 }
 
-func search(client milvusclient.Client, vectors []entity.Vector) {
-	topk := 10
-	nprobe := 20
-	sp, err := entity.NewIndexFlatSearchParam(nprobe)
+func setupCollection(client milvusclient.Client) {
+	ctx := context.Background()
+	schema := prepareSchema()
+	if has, err := client.HasCollection(ctx, collectionName); err != nil || has {
+		fmt.Println("collection already exists: ", collectionName)
+		return
+	}
+	if err := client.CreateCollection(ctx, schema, int32(shardNum)); err != nil {
+		panic(err)
+	}
+	fmt.Println("create collection: ", collectionName)
+
+	if err := client.CreatePartition(ctx, collectionName, partitionName); err != nil {
+		panic(err)
+	}
+	fmt.Println("create partition: ", partitionName)
+
+	repeat := 670
+	num := 1000
+	for i := 0; i < repeat; i++ {
+		insert(client, i, num)
+		fmt.Println("insert into collection: ", i)
+	}
+
+	index, err := entity.NewIndexHNSW("IP", 64, 250)
 	if err != nil {
 		panic(err)
 	}
-	start := time.Now()
-	_, err = client.Search(context.Background(), collectionName, []string{partitionName}, fmt.Sprintf("%s >= 0", f1), []string{f1, f2}, vectors, f3, entity.L2, topk, sp)
-	PutToSearchLatencys(int(time.Since(start).Milliseconds()))
-	if err != nil {
+	if err := client.CreateIndex(ctx, collectionName, f3, index, false); err != nil {
 		panic(err)
 	}
+	fmt.Println("create index")
 }
 
-func main() {
-	address := "localhost:19530"
+func search() {
+	client := newClient(address)
+	defer closeClient(client)
 
-	defer Save()
+	sp, err := entity.NewIndexHNSWSearchParam(250)
+	if err != nil {
+		panic(err)
+	}
 
-	insertClient := newClient(address)
-	defer closeClient(insertClient)
-
-	searchClient := newClient(address)
-	defer closeClient(searchClient)
-
-	dim := 128
-	prepare(insertClient, dim)
-
-	iter := 0
-	num := 500
-	insert(insertClient, iter, num, dim)
-	iter++
-
-	vectors := prepareVectors(10, dim)
-
-	var wg sync.WaitGroup
-
-	per := 12
-	n := 400
-	for i := 0; i < n; i++ {
-		for j := 0; j < per; j++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if rand.Int()%2 == 0 {
-					insert(insertClient, iter, num, dim)
-					iter++
-				} else {
-					search(searchClient, vectors)
-				}
-			}()
+	for i := 0 ; i < sampleCount ; i++ {
+		_, err = client.Search(context.Background(), collectionName, []string{partitionName}, fmt.Sprintf("%s >= 0", f1), []string{f1, f2}, vectors, f3, entity.L2, topk, sp)
+		if err != nil {
+			panic(err)
 		}
-		wg.Wait()
+		if (i+1)%100 == 0 {
+			fmt.Println("search done: ", i)
+		}
 	}
 }
+
+func ebay() {
+	client := newClient(address)
+	defer closeClient(client)
+	setupCollection(client)
+
+	ctx := context.Background()
+	if err := client.LoadCollection(ctx, collectionName, false); err != nil {
+		panic(err)
+	}
+	fmt.Println("load collection: ", collectionName)
+
+	wg := sync.WaitGroup{}
+	for i := 0; i < threadCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			search()
+		}()
+	}
+	wg.Wait()
+}
+
